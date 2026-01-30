@@ -5,15 +5,25 @@ selected class boxes via cut-and-paste rearrangement.
 Example:
 python yolo_bg_augment.py /path/to/yolo_dataset /path/to/output \\
   --classes cat dog --splits train --max-aug-total 500
+
+python yolo_bg_augment.py \
+/path/to/yolo_dataset \
+/path/to/output \
+--classes table shape label \
+--class-weights 8 5 1 \
+--dense-step 5 --workers 2 \
+--dump-bucket-dir /home/huypham/Downloads/chouhyo/pages/data-yolo-all-aug-yolo-aug2-debug 
 """
 
 # from __future__ import annotations
 
 import argparse
 import itertools
+import json
 import multiprocessing as mp
 import os
 import random
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +56,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("source", type=Path, help="YOLO dataset root containing data.yaml.")
     parser.add_argument("dest", type=Path, help="Output dataset root.")
+    parser.add_argument(
+        "--mode",
+        choices=["bucket", "augment"],
+        default="augment",
+        help="Run mode: build bucket only or augment dataset (default: augment).",
+    )
+    parser.add_argument(
+        "--bucket-dir",
+        type=Path,
+        default=None,
+        help="Bucket directory to write/read (default: <dest> in bucket mode).",
+    )
+    parser.add_argument(
+        "--bucket-stats",
+        type=Path,
+        default=None,
+        help="Optional JSON stats path to save/load bucket/dataset stats.",
+    )
     parser.add_argument(
         "--classes",
         nargs="+",
@@ -128,7 +156,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fill-max-tries",
         type=int,
-        default=100,
+        default=500,
         help="Max placement attempts when filling empty space. Default: 200.",
     )
     parser.add_argument(
@@ -208,6 +236,18 @@ def parse_args() -> argparse.Namespace:
         help="Max number of debug masks to save. Default: 200.",
     )
     parser.add_argument(
+        "--dump-bucket-dir",
+        type=Path,
+        default=None,
+        help="Optional directory to save bucket crops for debugging.",
+    )
+    parser.add_argument(
+        "--dump-bucket-limit",
+        type=int,
+        default=0,
+        help="Max crops to save per class/seg bucket (0 = no limit).",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=13,
@@ -248,6 +288,21 @@ def copy_metadata(src_root: Path, dest_root: Path) -> None:
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def sanitize_name(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip())
+    return cleaned or "class"
+
+
+def list_image_files(folder: Path) -> List[Path]:
+    return sorted(
+        [
+            path
+            for path in folder.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTS
+        ]
+    )
 
 
 def find_image(images_dir: Path, stem: str) -> Optional[Path]:
@@ -410,34 +465,17 @@ def iou(box_a: Sequence[int], box_b: Sequence[int]) -> float:
     return inter_area / denom
 
 
-def union_box(box_a: Sequence[int], box_b: Sequence[int]) -> Tuple[int, int, int, int]:
-    ax1, ay1, ax2, ay2 = box_a
-    bx1, by1, bx2, by2 = box_b
-    return min(ax1, bx1), min(ay1, by1), max(ax2, bx2), max(ay2, by2)
-
-
 def merge_boxes(
     yolo_boxes: List[Tuple[int, int, int, int]],
     seg_boxes: List[Tuple[int, int, int, int]],
     merge_iou: float,
 ) -> Tuple[List[Tuple[int, int, int, int]], List[Tuple[int, int, int, int]]]:
-    remaining_seg = seg_boxes[:]
-    merged_yolo: List[Tuple[int, int, int, int]] = []
-    for yolo_box in yolo_boxes:
-        best_idx = None
-        best_iou = 0.0
-        for idx, seg_box in enumerate(remaining_seg):
-            score = iou(yolo_box, seg_box)
-            if score > best_iou:
-                best_iou = score
-                best_idx = idx
-        if best_idx is not None and best_iou >= merge_iou:
-            merged = union_box(yolo_box, remaining_seg[best_idx])
-            merged_yolo.append(merged)
-            remaining_seg.pop(best_idx)
-        else:
-            merged_yolo.append(yolo_box)
-    return merged_yolo, remaining_seg
+    remaining_seg: List[Tuple[int, int, int, int]] = []
+    for seg_box in seg_boxes:
+        overlaps = any(iou(yolo_box, seg_box) > 0.0 for yolo_box in yolo_boxes)
+        if not overlaps:
+            remaining_seg.append(seg_box)
+    return list(yolo_boxes), remaining_seg
 
 
 def rects_collide(box_a: Sequence[int], box_b: Sequence[int], pad: int = 0) -> bool:
@@ -791,6 +829,218 @@ def build_bucket(
     return bucket, seg_bucket
 
 
+def dump_bucket(
+    bucket: Dict[int, List[Blob]],
+    seg_bucket: List[Blob],
+    class_names: Sequence[str],
+    output_dir: Path,
+    limit: int,
+) -> None:
+    save_bucket_dir(bucket, seg_bucket, class_names, output_dir, limit=limit)
+
+
+def save_bucket_dir(
+    bucket: Dict[int, List[Blob]],
+    seg_bucket: List[Blob],
+    class_names: Sequence[str],
+    output_dir: Path,
+    limit: int = 0,
+) -> Tuple[Dict[int, int], int]:
+    if output_dir.exists() and any(output_dir.iterdir()):
+        print(f"[WARN] Bucket dir not empty: {output_dir}")
+    ensure_dir(output_dir)
+    classes_dir = output_dir / "classes"
+    seg_dir = output_dir / "seg"
+    ensure_dir(classes_dir)
+    ensure_dir(seg_dir)
+
+    saved_counts: Dict[int, int] = {}
+    for class_id, blobs in bucket.items():
+        name = class_names[class_id] if class_id < len(class_names) else f"class_{class_id}"
+        class_dir = classes_dir / f"{class_id:03d}_{sanitize_name(name)}"
+        ensure_dir(class_dir)
+        indices = list(range(len(blobs)))
+        if limit and limit > 0 and len(indices) > limit:
+            indices = random.sample(indices, limit)
+        saved_counts[class_id] = len(indices)
+        for out_idx, idx in enumerate(indices):
+            blob = blobs[idx]
+            out_path = class_dir / f"{out_idx:06d}.png"
+            cv2.imwrite(str(out_path), blob.image)
+
+    seg_saved = 0
+    indices = list(range(len(seg_bucket)))
+    if limit and limit > 0 and len(indices) > limit:
+        indices = random.sample(indices, limit)
+    seg_saved = len(indices)
+    for out_idx, idx in enumerate(indices):
+        blob = seg_bucket[idx]
+        out_path = seg_dir / f"{out_idx:06d}.png"
+        cv2.imwrite(str(out_path), blob.image)
+
+    return saved_counts, seg_saved
+
+
+def load_bucket_from_dir(
+    bucket_dir: Path,
+    selected_ids: Sequence[int],
+    class_names: Sequence[str],
+    max_per_class: int,
+    max_seg_bucket: int,
+) -> Tuple[Dict[int, List[Blob]], List[Blob]]:
+    bucket: Dict[int, List[Blob]] = {class_id: [] for class_id in selected_ids}
+    seg_bucket: List[Blob] = []
+    classes_dir = bucket_dir / "classes"
+    seg_dir = bucket_dir / "seg"
+    if classes_dir.exists():
+        class_dirs = [path for path in classes_dir.iterdir() if path.is_dir()]
+    else:
+        class_dirs = [
+            path
+            for path in bucket_dir.iterdir()
+            if path.is_dir() and path.name != "seg"
+        ]
+        if class_dirs:
+            print("[WARN] Bucket dir missing 'classes' folder; using root folders.")
+    if not class_dirs:
+        print(f"[WARN] No class folders found in {bucket_dir}")
+    name_lookup = {sanitize_name(name): idx for idx, name in enumerate(class_names)}
+
+    class_files: List[Tuple[int, Path]] = []
+    for class_dir in class_dirs:
+        match = re.match(r"^(\d+)", class_dir.name)
+        class_id = int(match.group(1)) if match else None
+        if class_id is None:
+            lookup_id = name_lookup.get(sanitize_name(class_dir.name))
+            class_id = lookup_id if lookup_id is not None else None
+        if class_id is None:
+            print(f"[WARN] Skipping bucket folder without class id: {class_dir}")
+            continue
+        if class_id not in selected_ids:
+            continue
+        files = list_image_files(class_dir)
+        if max_per_class > 0 and len(files) > max_per_class:
+            files = random.sample(files, max_per_class)
+        class_files.extend([(class_id, path) for path in files])
+
+    seg_files: List[Path] = []
+    if seg_dir.exists():
+        seg_files = list_image_files(seg_dir)
+        if max_seg_bucket > 0 and len(seg_files) > max_seg_bucket:
+            seg_files = random.sample(seg_files, max_seg_bucket)
+
+    total_files = len(class_files) + len(seg_files)
+    if total_files == 0:
+        return bucket, seg_bucket
+
+    with tqdm(total=total_files, desc="Loading bucket", unit="image") as pbar:
+        for class_id, path in class_files:
+            image = cv2.imread(str(path))
+            if image is None:
+                print(f"[WARN] Failed to read bucket image {path}")
+                pbar.update(1)
+                continue
+            bucket[class_id].append(Blob(image, class_id))
+            pbar.update(1)
+        for path in seg_files:
+            image = cv2.imread(str(path))
+            if image is None:
+                print(f"[WARN] Failed to read bucket image {path}")
+                pbar.update(1)
+                continue
+            seg_bucket.append(Blob(image, None))
+            pbar.update(1)
+
+    return bucket, seg_bucket
+
+
+def print_bucket_stats(
+    bucket_counts: Dict[int, int],
+    seg_count: int,
+    class_names: Sequence[str],
+    selected_ids: Sequence[int],
+) -> None:
+    print("Bucket stats (saved items):")
+    for class_id in selected_ids:
+        name = class_names[class_id] if class_id < len(class_names) else f"class_{class_id}"
+        print(f"  {name}: {bucket_counts.get(class_id, 0)}")
+    print(f"  seg: {seg_count}")
+
+
+def build_stats(
+    selected_ids: Sequence[int],
+    class_names: Sequence[str],
+    counts: Optional[Dict[int, int]],
+    heatmaps: Optional[Dict[int, np.ndarray]],
+    grid_w: int,
+    grid_h: int,
+    bucket_counts: Optional[Dict[int, int]],
+    seg_count: int,
+    bucket_dir: Optional[Path],
+) -> Dict[str, object]:
+    classes = [
+        {"id": class_id, "name": class_names[class_id]}
+        for class_id in selected_ids
+        if class_id < len(class_names)
+    ]
+    stats: Dict[str, object] = {
+        "version": 1,
+        "classes": classes,
+        "heatmap_grid": [grid_w, grid_h],
+        "seg_bucket_count": seg_count,
+    }
+    if bucket_dir is not None:
+        stats["bucket_dir"] = str(bucket_dir)
+    if counts is not None:
+        stats["dataset_counts"] = {str(cid): int(counts.get(cid, 0)) for cid in selected_ids}
+    if heatmaps is not None:
+        stats["heatmaps"] = {str(cid): heatmaps[cid].tolist() for cid in selected_ids}
+    if bucket_counts is not None:
+        stats["bucket_counts"] = {str(cid): int(bucket_counts.get(cid, 0)) for cid in selected_ids}
+    return stats
+
+
+def save_stats(stats: Dict[str, object], output_path: Path) -> None:
+    ensure_dir(output_path.parent)
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(stats, f, indent=2, sort_keys=True)
+
+
+def load_stats(stats_path: Path) -> Dict[str, object]:
+    with stats_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def parse_stats_counts(
+    stats: Dict[str, object], selected_ids: Sequence[int]
+) -> Optional[Dict[int, int]]:
+    raw = stats.get("dataset_counts")
+    if not isinstance(raw, dict):
+        return None
+    counts: Dict[int, int] = {}
+    for class_id in selected_ids:
+        value = raw.get(str(class_id), raw.get(class_id))
+        if value is None:
+            return None
+        counts[class_id] = int(value)
+    return counts
+
+
+def parse_stats_heatmaps(
+    stats: Dict[str, object], selected_ids: Sequence[int]
+) -> Optional[Dict[int, np.ndarray]]:
+    raw = stats.get("heatmaps")
+    if not isinstance(raw, dict):
+        return None
+    heatmaps: Dict[int, np.ndarray] = {}
+    for class_id in selected_ids:
+        value = raw.get(str(class_id), raw.get(class_id))
+        if value is None:
+            return None
+        heatmaps[class_id] = np.array(value, dtype=np.int32)
+    return heatmaps
+
+
 def copy_original_dataset(
     source_root: Path, dest_root: Path, splits: Sequence[str]
 ) -> None:
@@ -1081,19 +1331,87 @@ def main() -> None:
         print("[WARN] No images found for the requested splits.")
         return
 
-    counts = collect_counts(entries, selected_ids)
-    heatmaps = collect_heatmaps(
-        entries,
-        selected_ids,
-        args.heatmap_grid[0],
-        args.heatmap_grid[1],
-    )
+    bucket_dir = args.bucket_dir
+    if args.mode == "bucket" and bucket_dir is None:
+        bucket_dir = args.dest
+
+    stats_path = args.bucket_stats
+    auto_stats_path = bucket_dir / "bucket_stats.json" if bucket_dir is not None else None
+    stats: Optional[Dict[str, object]] = None
+    counts: Optional[Dict[int, int]] = None
+    heatmaps: Optional[Dict[int, np.ndarray]] = None
+    if args.mode == "augment":
+        if stats_path is None and auto_stats_path is not None and auto_stats_path.exists():
+            stats_path = auto_stats_path
+        if stats_path is not None and stats_path.exists():
+            try:
+                stats = load_stats(stats_path)
+                counts = parse_stats_counts(stats, selected_ids)
+                heatmaps = parse_stats_heatmaps(stats, selected_ids)
+                if counts is not None or heatmaps is not None:
+                    print(f"[INFO] Using stats from {stats_path}")
+            except Exception as exc:
+                print(f"[WARN] Failed to read stats file {stats_path}: {exc}")
+        elif args.bucket_stats is not None and stats_path is not None and not stats_path.exists():
+            print(f"[WARN] Stats file not found: {stats_path}")
+
+    if counts is None:
+        counts = collect_counts(entries, selected_ids)
+    if heatmaps is None:
+        heatmaps = collect_heatmaps(
+            entries,
+            selected_ids,
+            args.heatmap_grid[0],
+            args.heatmap_grid[1],
+        )
     print("Selected class counts:")
     for name in args.classes:
         class_id = name_to_idx[name]
         weight = weights.get(class_id, 1.0)
         print(f"  {name}: {counts.get(class_id, 0)} (weight={weight})")
     print_heatmaps(heatmaps, args.classes, name_to_idx)
+
+    if args.mode == "bucket":
+        if bucket_dir is None:
+            raise SystemExit("--bucket-dir is required in bucket mode.")
+        debug_dir = args.debug_dir or (bucket_dir / "debug")
+        bucket, seg_bucket = build_bucket(
+            entries,
+            selected_ids,
+            args.border_pad,
+            args.bg_threshold,
+            args.min_area,
+            args.merge_iou,
+            args.max_bucket_per_class,
+            args.max_seg_bucket,
+            args.bucket_max_images,
+            args.bucket_sample_rate,
+            args.debug,
+            debug_dir,
+            args.debug_max,
+        )
+        saved_counts, seg_saved = save_bucket_dir(
+            bucket, seg_bucket, class_names, bucket_dir
+        )
+        print_bucket_stats(saved_counts, seg_saved, class_names, selected_ids)
+        if stats_path is None:
+            stats_path = auto_stats_path
+        if stats_path is not None:
+            stats = build_stats(
+                selected_ids,
+                class_names,
+                counts,
+                heatmaps,
+                args.heatmap_grid[0],
+                args.heatmap_grid[1],
+                saved_counts,
+                seg_saved,
+                bucket_dir,
+            )
+            save_stats(stats, stats_path)
+            print(f"Saved stats to {stats_path}")
+        print(f"Bucket saved to {bucket_dir}")
+        return
 
     if args.copy_original:
         copy_original_dataset(args.source, args.dest, args.splits)
@@ -1116,22 +1434,39 @@ def main() -> None:
         print("Selected classes already balanced; no augmentation needed.")
         return
 
-    debug_dir = args.debug_dir or (args.dest / "debug")
-    bucket, seg_bucket = build_bucket(
-        entries,
-        selected_ids,
-        args.border_pad,
-        args.bg_threshold,
-        args.min_area,
-        args.merge_iou,
-        args.max_bucket_per_class,
-        args.max_seg_bucket,
-        args.bucket_max_images,
-        args.bucket_sample_rate,
-        args.debug,
-        debug_dir,
-        args.debug_max,
-    )
+    if args.bucket_dir:
+        bucket, seg_bucket = load_bucket_from_dir(
+            args.bucket_dir,
+            selected_ids,
+            class_names,
+            args.max_bucket_per_class,
+            args.max_seg_bucket,
+        )
+    else:
+        debug_dir = args.debug_dir or (args.dest / "debug")
+        bucket, seg_bucket = build_bucket(
+            entries,
+            selected_ids,
+            args.border_pad,
+            args.bg_threshold,
+            args.min_area,
+            args.merge_iou,
+            args.max_bucket_per_class,
+            args.max_seg_bucket,
+            args.bucket_max_images,
+            args.bucket_sample_rate,
+            args.debug,
+            debug_dir,
+            args.debug_max,
+        )
+    if args.dump_bucket_dir:
+        dump_bucket(
+            bucket,
+            seg_bucket,
+            class_names,
+            args.dump_bucket_dir,
+            args.dump_bucket_limit,
+        )
     if not any(bucket.values()):
         print("[WARN] No class blobs collected for augmentation.")
         return
