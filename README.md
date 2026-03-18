@@ -20,6 +20,7 @@ python_tools/
 │   ├── filter_ref_boxes.py        # Filter reference boxes
 │   ├── filter_small_thin_boxes.py # Filter small/thin boxes
 │   ├── polygon_to_bbox.py         # Convert polygons to bboxes
+│   ├── eval_insight.py             # Evaluate model & find poor cases
 │   ├── seg_to_bbox.py             # Convert segmentation to bboxes
 │   └── resize_padding.py          # Resize with padding
 ├── csv/                           # CSV tools
@@ -39,6 +40,9 @@ python3 csv/to_payload.py --help
 
 # bg_augment (has subpackage imports, run as module)
 python3 -m yolo.bg_augment --help
+
+# Evaluate model on test set — find poor cases for enhancement
+python3 yolo/eval_insight.py path/to/data.yaml path/to/best.pt output/ --split test
 ```
 
 ## Requirements
@@ -48,3 +52,5 @@ python3 -m yolo.bg_augment --help
 - numpy
 - tqdm
 - pyyaml
+- ultralytics (for eval_insight.py)
+- matplotlib (for eval_insight.py)
