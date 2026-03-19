@@ -1,0 +1,14 @@
+[project]
+name = "python-tools"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "fiftyone>=1.13.4",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.3",
+    "opencv-python>=4.13.0.92",
+    "pyyaml>=6.0.3",
+    "tqdm>=4.67.3",
+    "ultralytics>=8.4.23",
+]
