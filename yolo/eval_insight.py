@@ -129,7 +129,16 @@ def resolve_split_dir(data_yaml: Path, split: str) -> Path:
         raise ValueError(f"Split '{split}' not found in {data_yaml}")
     split_path = Path(split_path)
     if not split_path.is_absolute():
-        split_path = (data_yaml.parent / split_path).resolve()
+        resolved = (data_yaml.parent / split_path).resolve()
+        if not resolved.exists():
+            # Roboflow data.yaml uses ../split/images but dirs are local
+            stripped = Path(str(split_path).lstrip("./").lstrip("../"))
+            fallback = (data_yaml.parent / stripped).resolve()
+            if fallback.exists():
+                resolved = fallback
+            else:
+                print(f"[WARN] Split path not found: {resolved} (also tried {fallback})")
+        split_path = resolved
     # data.yaml may point to images/ dir or split root
     if split_path.name != "images" and (split_path / "images").is_dir():
         return split_path / "images"
@@ -202,14 +211,13 @@ def run_inference(model: YOLO, image_paths: List[Path], args: argparse.Namespace
         conf=args.conf,
         iou=args.nms_iou,
         imgsz=args.img_size,
-        batch=args.batch,
-        verbose=False,
     )
     if args.device is not None:
         kwargs["device"] = args.device
 
-    results = model.predict(source=[str(p) for p in image_paths], stream=True, **kwargs)
-    for result in tqdm(results, total=len(image_paths), desc="Inference"):
+    for p in tqdm(image_paths, desc="Inference"):
+        results = model.predict(source=str(p), verbose=False, **kwargs)
+        result = results[0]
         img_path = Path(result.path).resolve()
         boxes = []
         if result.boxes is not None:
