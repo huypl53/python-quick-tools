@@ -38,9 +38,9 @@ def parse_args() -> argparse.Namespace:
         help="Class name to use in single mode. Default: object.",
     )
     parser.add_argument(
-        "--keep-empty",
+        "--drop-empty",
         action="store_true",
-        help="Copy images even if labels become empty; writes empty label files.",
+        help="Skip images where all annotations were removed (default: keep them as negative examples).",
     )
     return parser.parse_args()
 
@@ -109,7 +109,7 @@ def process_dataset(
     source: Path,
     dest: Path,
     mapping: Dict[int, int],
-    keep_empty: bool,
+    drop_empty: bool,
 ) -> Tuple[int, int]:
     total_labels = 0
     copied = 0
@@ -144,7 +144,7 @@ def process_dataset(
                     else:
                         new_lines.append(str(new_class))
 
-            if not new_lines and not keep_empty:
+            if not new_lines and drop_empty:
                 continue
 
             with dest_label_path.open("w", encoding="utf-8") as out:
@@ -184,7 +184,7 @@ def main() -> None:
         mapping, new_names = build_mapping_group_prefix(names)
 
     copy_metadata(source, dest, new_names)
-    total, copied = process_dataset(source, dest, mapping, args.keep_empty)
+    total, copied = process_dataset(source, dest, mapping, args.drop_empty)
 
     print(f"Processed label files: {total}")
     print(f"Copied files: {copied}")
