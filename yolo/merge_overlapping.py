@@ -115,8 +115,14 @@ def merge_boxes(
     threshold: float,
     absorb_ids: Optional[Set[int]],
     into_ids: Optional[Set[int]],
-) -> Tuple[List[Tuple[int, float, float, float, float, List[str]]], int]:
-    """Return (kept_entries, absorbed_count)."""
+    reclassify_to: Optional[int],
+) -> Tuple[List[Tuple[int, float, float, float, float, List[str]]], int, int]:
+    """Return (kept_entries, absorbed_count, reclassified_count).
+
+    Boxes of absorb classes that are contained in into boxes are dropped.
+    Remaining absorb boxes that were NOT absorbed are reclassified to the
+    ``reclassify_to`` class (when set).
+    """
     n = len(entries)
     corners = [yolo_to_corners(e[1], e[2], e[3], e[4]) for e in entries]
     areas = [box_area(c) for c in corners]
@@ -141,8 +147,18 @@ def merge_boxes(
             if areas[j] > 0 and inter / areas[j] >= threshold:
                 absorbed.add(j)
 
-    kept = [e for idx, e in enumerate(entries) if idx not in absorbed]
-    return kept, len(absorbed)
+    # Reclassify leftover absorb boxes to the into class
+    reclassified = 0
+    kept: List[Tuple[int, float, float, float, float, List[str]]] = []
+    for idx, e in enumerate(entries):
+        if idx in absorbed:
+            continue
+        if reclassify_to is not None and absorb_ids is not None and e[0] in absorb_ids:
+            kept.append((reclassify_to, e[1], e[2], e[3], e[4], e[5]))
+            reclassified += 1
+        else:
+            kept.append(e)
+    return kept, len(absorbed), reclassified
 
 
 def format_line(entry: Tuple[int, float, float, float, float, List[str]]) -> str:
@@ -151,8 +167,45 @@ def format_line(entry: Tuple[int, float, float, float, float, List[str]]) -> str
     return " ".join(tokens)
 
 
+def build_remap(
+    names: List[str], absorb_ids: Optional[Set[int]]
+) -> Tuple[Dict[int, int], List[str]]:
+    """Build old_to_new ID map and new names list, removing absorbed classes."""
+    if absorb_ids is None:
+        return {i: i for i in range(len(names))}, list(names)
+    kept_names: List[str] = []
+    old_to_new: Dict[int, int] = {}
+    new_id = 0
+    for old_id, name in enumerate(names):
+        if old_id in absorb_ids:
+            continue
+        old_to_new[old_id] = new_id
+        kept_names.append(name)
+        new_id += 1
+    return old_to_new, kept_names
+
+
+def remap_entry(
+    entry: Tuple[int, float, float, float, float, List[str]],
+    old_to_new: Dict[int, int],
+) -> Tuple[int, float, float, float, float, List[str]]:
+    cid, x, y, w, h, extras = entry
+    return (old_to_new[cid], x, y, w, h, extras)
+
+
+def write_data_yaml(source: Path, dest: Path, new_names: List[str]) -> None:
+    data_yaml = source / "data.yaml"
+    if data_yaml.exists():
+        with data_yaml.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        data["names"] = new_names
+        data["nc"] = len(new_names)
+        with (dest / "data.yaml").open("w", encoding="utf-8") as f:
+            yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
+
+
 def copy_metadata(src: Path, dest: Path) -> None:
-    for name in ["data.yaml", "README.dataset.txt", "README.roboflow.txt"]:
+    for name in ["README.dataset.txt", "README.roboflow.txt"]:
         candidate = src / name
         if candidate.exists():
             shutil.copy2(candidate, dest / name)
@@ -168,9 +221,19 @@ def main() -> None:
     absorb_ids = name_to_ids(names, args.absorb)
     into_ids = name_to_ids(names, args.into)
 
+    # Determine reclassify target: first --into class
+    reclassify_to: Optional[int] = None
+    if args.into and into_ids:
+        name_map = {n: i for i, n in enumerate(names)}
+        reclassify_to = name_map[args.into[0]]
+
+    # Build ID remap: absorbed classes are removed from the output
+    old_to_new, new_names = build_remap(names, absorb_ids)
+
     total_files = 0
     copied_files = 0
     total_absorbed = 0
+    total_reclassified = 0
 
     for dirpath, _, filenames in os.walk(source):
         if Path(dirpath).name != "labels":
@@ -191,10 +254,12 @@ def main() -> None:
                     if parsed:
                         entries.append(parsed)
 
-            kept, absorbed_count = merge_boxes(
-                entries, args.threshold, absorb_ids, into_ids
+            merged, absorbed_count, reclassified_count = merge_boxes(
+                entries, args.threshold, absorb_ids, into_ids, reclassify_to
             )
             total_absorbed += absorbed_count
+            total_reclassified += reclassified_count
+            kept = [remap_entry(e, old_to_new) for e in merged]
 
             if not kept and args.drop_empty:
                 continue
@@ -218,11 +283,13 @@ def main() -> None:
             shutil.copy2(image_path, dest_images_dir / image_path.name)
             copied_files += 1
 
+    write_data_yaml(source, dest, new_names)
     copy_metadata(source, dest)
 
     print(f"Processed label files: {total_files}")
     print(f"Copied files: {copied_files}")
-    print(f"Boxes absorbed: {total_absorbed}")
+    print(f"Boxes absorbed (dropped): {total_absorbed}")
+    print(f"Boxes reclassified to --into class: {total_reclassified}")
     print(f"Output: {dest}")
 
 
